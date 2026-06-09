@@ -93,7 +93,7 @@ class ExecutionLogger:
         with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
-        logger.debug("execution_log", event=event_type.value, iteration=iteration)
+        logger.debug("execution_log_entry", event_type=event_type.value, iteration=iteration)
 
     def log_tool_call(
         self,

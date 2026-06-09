@@ -1,21 +1,21 @@
-"""Agent Loop — Core reasoning engine.
+"""Agent Loop — Core reasoning engine (PRODUCTION).
 
-Adapted from SOAR's IncidentPipeline pattern:
-  SOAR:  Event → Normalize → Correlate → Score → Decision → Playbook → Audit
-  Agent: Evidence → Plan → Execute Tools → Evaluate → Self-Correct → Report
+Implements the full agent cycle:
+  Evidence → Plan → [LLM reasons → Calls tools → Evaluates → Self-corrects] → Report
 
-This is the main execution spine. It:
-1. Plans which tools to run based on evidence type
-2. Calls MCP tools and collects output
-3. Evaluates findings for consistency
-4. Self-corrects when inconsistencies detected
-5. Produces structured findings with evidence chains
+The agent uses Claude in tool-use mode. Each iteration:
+1. Send current state (findings, plan phase, tool results) to Claude
+2. Claude responds with either text (reasoning) or tool_use (action)
+3. If tool_use: dispatch via ToolDispatcher (policy-gated)
+4. Feed tool result back to Claude
+5. Claude produces findings or requests next tool
+6. Every 3 iterations: run self-correction checks
 """
 
 from __future__ import annotations
 
+import json
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,11 +24,20 @@ import structlog
 
 from ..config import Settings
 from ..core.audit_logger import EventType, ExecutionLogger
-from ..core.evidence import EvidenceType, verify_evidence, verify_integrity_post_analysis
-from ..core.findings import AnalysisResult, ForensicFinding
+from ..core.evidence import verify_evidence, verify_integrity_post_analysis
+from ..core.findings import (
+    AnalysisResult,
+    Confidence,
+    EvidenceSource,
+    FindingCategory,
+    ForensicFinding,
+)
 from ..core.policy import PolicyEngine
-from .planner import AnalysisPlan, Planner
+from .llm_client import LLMClient, LLMResponse
+from .planner import Planner
+from .prompts import ANALYST_SYSTEM_PROMPT
 from .self_correction import SelfCorrector
+from .tool_dispatcher import ToolDispatcher, get_anthropic_tool_definitions
 
 logger = structlog.get_logger()
 
@@ -38,7 +47,7 @@ class AgentLoop:
 
     Architecture:
         Agent Loop (this) → Policy Gate → MCP Server → SIFT Tools
-                                                    ↓
+                                      ↓
         Cloudflare AI Gateway ← LLM (Claude) ← Agent reasoning
 
     The agent CANNOT bypass the policy gate or call tools directly.
@@ -53,6 +62,8 @@ class AgentLoop:
             max_iterations=settings.agent_max_iterations,
             read_only=settings.evidence_read_only,
         )
+        self._llm = LLMClient(settings)
+        self._dispatcher = ToolDispatcher(self._policy, self._execution_logger)
         self._planner = Planner()
         self._self_corrector = SelfCorrector()
         self._findings: list[ForensicFinding] = []
@@ -65,10 +76,7 @@ class AgentLoop:
         evidence_type: str,
         max_iterations: int,
     ) -> AnalysisResult:
-        """Execute the full analysis loop.
-
-        Returns AnalysisResult with findings, stats, and success/failure.
-        """
+        """Execute the full analysis loop."""
         result = AnalysisResult(
             case_path=str(case_path),
             evidence_type=evidence_type,
@@ -91,7 +99,17 @@ class AgentLoop:
             # Phase 2: Plan initial analysis
             plan = self._planner.create_plan(evidence_type)  # type: ignore[arg-type]
 
-            # Phase 3: Execute reasoning loop
+            # Phase 3: Build initial message for Claude
+            messages: list[dict[str, Any]] = [
+                {
+                    "role": "user",
+                    "content": self._build_initial_prompt(case_path, evidence_type, plan),
+                }
+            ]
+
+            tools = get_anthropic_tool_definitions()
+
+            # Phase 4: Agent reasoning loop
             for iteration in range(1, max_iterations + 1):
                 self._iteration = iteration
 
@@ -99,27 +117,102 @@ class AgentLoop:
                 budget_check = self._policy.check_iteration_budget(iteration)
                 if not budget_check.allowed:
                     logger.warning("iteration_budget_exhausted", reason=budget_check.reason)
+                    # Ask Claude to finalize
+                    messages.append({
+                        "role": "user",
+                        "content": "ITERATION BUDGET REACHED. Produce your final findings now. Summarize what you found and what remains uncertain.",
+                    })
+                    final_response = self._llm.chat(
+                        messages=messages, tools=tools, system=ANALYST_SYSTEM_PROMPT
+                    )
+                    self._extract_findings_from_text(final_response.text_content, iteration)
                     break
 
                 self._execution_logger.log(
                     EventType.ITERATION_START,
                     iteration=iteration,
-                    data={"plan_phase": plan.current_phase},
+                    data={"plan_phase": plan.current_phase, "findings_count": len(self._findings)},
                 )
 
-                # Execute one reasoning step
-                step_result = self._execute_step(plan, iteration)
+                # Call Claude
+                response = self._llm.chat(
+                    messages=messages, tools=tools, system=ANALYST_SYSTEM_PROMPT
+                )
 
                 self._execution_logger.log(
-                    EventType.ITERATION_COMPLETE,
+                    EventType.LLM_RESPONSE,
                     iteration=iteration,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    duration_ms=response.duration_ms,
                     data={
-                        "findings_count": len(self._findings),
-                        "step_outcome": step_result.get("outcome", "unknown"),
+                        "stop_reason": response.stop_reason,
+                        "tool_calls_count": len(response.tool_calls),
                     },
                 )
 
-                # Self-correction check every N iterations
+                # If Claude wants to use tools
+                if response.has_tool_calls:
+                    # Add assistant message to history
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content_blocks,
+                    })
+
+                    # Execute each tool call
+                    tool_results = []
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call["name"]
+                        tool_input = tool_call["input"]
+                        tool_use_id = tool_call["id"]
+
+                        # Dispatch through policy gate
+                        tool_output = self._dispatcher.execute(
+                            tool_name=tool_name,
+                            tool_input=tool_input,
+                            iteration=iteration,
+                        )
+
+                        # Truncate large outputs for context window management
+                        output_str = json.dumps(tool_output, default=str)
+                        if len(output_str) > 15000:
+                            output_str = output_str[:15000] + "\n... [TRUNCATED — output too large for context]"
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": output_str,
+                        })
+
+                    # Feed tool results back to Claude
+                    messages.append({
+                        "role": "user",
+                        "content": tool_results,
+                    })
+
+                else:
+                    # Claude responded with text only (reasoning/findings)
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content_blocks,
+                    })
+
+                    # Check if Claude signaled completion
+                    text = response.text_content
+                    if "ANALYSIS_COMPLETE" in text:
+                        self._extract_findings_from_text(text, iteration)
+                        break
+
+                    # Extract any findings from reasoning text
+                    self._extract_findings_from_text(text, iteration)
+
+                    # Prompt for next action
+                    messages.append({
+                        "role": "user",
+                        "content": self._build_continuation_prompt(iteration, plan),
+                    })
+
+                # Self-correction check every 3 iterations
                 if iteration % 3 == 0 and self._findings:
                     corrections = self._self_corrector.check(self._findings)
                     if corrections:
@@ -131,12 +224,22 @@ class AgentLoop:
                                 reason=correction["reason"],
                                 action=correction["action"],
                             )
+                        # Inform Claude about corrections
+                        messages.append({
+                            "role": "user",
+                            "content": self._build_correction_prompt(corrections),
+                        })
 
-                # Check if analysis is complete
-                if step_result.get("outcome") == "complete":
-                    break
+                self._execution_logger.log(
+                    EventType.ITERATION_COMPLETE,
+                    iteration=iteration,
+                    data={
+                        "findings_count": len(self._findings),
+                        "stop_reason": response.stop_reason,
+                    },
+                )
 
-            # Phase 4: Verify evidence integrity preserved
+            # Phase 5: Verify evidence integrity preserved
             integrity_ok = verify_integrity_post_analysis(evidence)
 
             # Compile result
@@ -174,24 +277,143 @@ class AgentLoop:
 
         return result
 
-    def _execute_step(self, plan: AnalysisPlan, iteration: int) -> dict[str, Any]:
-        """Execute a single reasoning step.
+    # ─── Prompt Construction ──────────────────────────────────────────
 
-        This is where the LLM is called to:
-        1. Look at current findings and plan
-        2. Decide which tool to call next
-        3. Interpret tool output
-        4. Update findings
+    def _build_initial_prompt(self, case_path: Path, evidence_type: str, plan: Any) -> str:
+        """Build the initial user message that kicks off analysis."""
+        phase_info = plan.phases[0] if plan.phases else None
+        phase_tools = ", ".join(phase_info.tools) if phase_info else "all"
 
-        TODO: Wire to actual Anthropic client + MCP tool calls.
-        Skeleton returns placeholder for init commit.
+        return f"""Analyze this forensic evidence and find evil.
+
+## Evidence
+- **Path:** {case_path}
+- **Type:** {evidence_type}
+- **Mount:** The evidence is mounted read-only. All paths you provide to tools should use the full path.
+
+## Your Task
+1. Start with {phase_info.name if phase_info else 'survey'}: {phase_info.description if phase_info else 'understand the evidence'}
+2. Use the available forensic tools to investigate
+3. Build findings with evidence chains
+4. Self-correct if you find inconsistencies
+
+## Analysis Plan
+Phase 1: {phase_info.name if phase_info else 'survey'} — tools: {phase_tools}
+Then: deeper analysis based on what you find.
+
+## Output
+When you have findings, output them as structured JSON in this format:
+```json
+{{
+  "finding": {{
+    "category": "malware_execution|persistence|lateral_movement|...",
+    "confidence": "confirmed|high|medium|low",
+    "title": "One-line summary",
+    "description": "What you found with specifics",
+    "iocs": ["indicator1", "indicator2"],
+    "mitre_attack": ["T1234"],
+    "timeline_position": "2026-01-15T14:30:00Z"
+  }}
+}}
+```
+
+When analysis is complete, include "ANALYSIS_COMPLETE" in your response.
+
+Begin with your first tool call."""
+
+    def _build_continuation_prompt(self, iteration: int, plan: Any) -> str:
+        """Prompt to keep the agent working."""
+        findings_summary = ""
+        if self._findings:
+            findings_summary = f"\n\nCurrent findings ({len(self._findings)}):\n"
+            for f in self._findings[-3:]:  # Last 3
+                findings_summary += f"- [{f.confidence.value}] {f.title}\n"
+
+        return f"""Continue your analysis. Iteration {iteration}/{self._settings.agent_max_iterations}.
+{findings_summary}
+What should you investigate next? Use a tool or report findings.
+If you believe analysis is complete, include "ANALYSIS_COMPLETE" in your response."""
+
+    def _build_correction_prompt(self, corrections: list[dict[str, Any]]) -> str:
+        """Inform the agent about self-correction results."""
+        lines = ["⚠️ SELF-CORRECTION CHECK detected issues:\n"]
+        for c in corrections:
+            lines.append(f"- Finding `{c['finding_id']}`: {c['reason']} → Action: {c['action']}")
+        lines.append("\nPlease review and adjust your analysis. Re-investigate if needed.")
+        return "\n".join(lines)
+
+    # ─── Finding Extraction ───────────────────────────────────────────
+
+    def _extract_findings_from_text(self, text: str, iteration: int) -> None:
+        """Parse structured findings from Claude's text response.
+
+        Looks for JSON blocks with finding schema.
         """
-        # Placeholder for LLM interaction
-        # In full implementation:
-        # 1. Build prompt with current state (findings, plan phase)
-        # 2. Call Claude via CF AI Gateway
-        # 3. Parse tool_use blocks
-        # 4. Execute tool via MCP
-        # 5. Feed result back to Claude
-        # 6. Extract findings from response
-        return {"outcome": "complete", "reason": "skeleton_implementation"}
+        import re
+
+        # Find JSON blocks with finding data
+        pattern = r'```json\s*\n(.*?)\n\s*```'
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match)
+                finding_data = data.get("finding", data)
+
+                # Map to our schema
+                category_str = finding_data.get("category", "suspicious_activity")
+                confidence_str = finding_data.get("confidence", "medium")
+
+                try:
+                    category = FindingCategory(category_str)
+                except ValueError:
+                    category = FindingCategory.SUSPICIOUS_ACTIVITY
+
+                try:
+                    confidence = Confidence(confidence_str)
+                except ValueError:
+                    confidence = Confidence.MEDIUM
+
+                finding = ForensicFinding(
+                    category=category,
+                    confidence=confidence,
+                    title=finding_data.get("title", "Untitled finding"),
+                    description=finding_data.get("description", ""),
+                    iocs=finding_data.get("iocs", []),
+                    mitre_attack=finding_data.get("mitre_attack", []),
+                    evidence_sources=[],  # Will be populated by tool call linkage
+                )
+
+                # Parse timeline
+                timeline_str = finding_data.get("timeline_position")
+                if timeline_str:
+                    try:
+                        finding.timeline_position = datetime.fromisoformat(
+                            timeline_str.replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+                self._findings.append(finding)
+                self._execution_logger.log(
+                    EventType.FINDING_CREATED,
+                    iteration=iteration,
+                    data={
+                        "finding_id": finding.finding_id,
+                        "category": finding.category.value,
+                        "confidence": finding.confidence.value,
+                        "title": finding.title,
+                    },
+                )
+
+                logger.info(
+                    "finding_extracted",
+                    finding_id=finding.finding_id,
+                    category=category.value,
+                    confidence=confidence.value,
+                    title=finding.title,
+                )
+
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.debug("finding_extraction_skipped", reason=str(e))
+                continue

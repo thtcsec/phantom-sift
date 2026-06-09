@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+
+try:
+    from pydantic_settings import BaseSettings
+except ImportError:
+    # Fallback if pydantic-settings not installed yet
+    from pydantic import BaseModel as BaseSettings  # type: ignore[assignment]
 
 
 class Settings(BaseSettings):

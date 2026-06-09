@@ -16,7 +16,7 @@ from typing import Any
 
 import structlog
 
-from ..core.findings import Confidence, ForensicFinding
+from ..core.findings import Confidence, FindingCategory, ForensicFinding
 
 logger = structlog.get_logger()
 
@@ -107,31 +107,25 @@ class SelfCorrector:
     ) -> list[dict[str, Any]]:
         """Detect directly contradicting findings.
 
-        Example: Finding A says 'no network activity' but Finding B
-        lists C2 connections from the same process.
+        Example: Finding A says 'svchost.exe is legitimate' but Finding B
+        says 'svchost.exe has injected code' — same IOC, opposite conclusions.
         """
         corrections = []
 
-        # Group findings by category
-        by_category: dict[str, list[ForensicFinding]] = {}
-        for f in findings:
-            by_category.setdefault(f.category.value, []).append(f)
+        # Separate benign from non-benign findings
+        benign_findings = [f for f in findings if f.category == FindingCategory.BENIGN]
+        malicious_findings = [f for f in findings if f.category != FindingCategory.BENIGN]
 
-        # Check for BENIGN + malicious in same category referencing same artifact
-        for category, group in by_category.items():
-            benign = [f for f in group if f.category.value == "benign"]
-            malicious = [f for f in group if f.category.value != "benign"]
-
-            for b in benign:
-                for m in malicious:
-                    # If they reference the same IOC or artifact
-                    shared_iocs = set(b.iocs) & set(m.iocs)
-                    if shared_iocs:
-                        corrections.append({
-                            "finding_id": b.finding_id,
-                            "reason": f"Contradicts malicious finding {m.finding_id} on IOC {shared_iocs}",
-                            "action": "reinvestigate_both",
-                            "related_finding": m.finding_id,
-                        })
+        # Check for shared IOCs between benign and malicious findings
+        for b in benign_findings:
+            for m in malicious_findings:
+                shared_iocs = set(b.iocs) & set(m.iocs)
+                if shared_iocs:
+                    corrections.append({
+                        "finding_id": b.finding_id,
+                        "reason": f"Contradicts malicious finding {m.finding_id} on IOC {shared_iocs}",
+                        "action": "reinvestigate_both",
+                        "related_finding": m.finding_id,
+                    })
 
         return corrections

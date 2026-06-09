@@ -26,7 +26,7 @@ from mcp.server.fastmcp import FastMCP
 # Initialize MCP server
 mcp = FastMCP(
     "phantom-sift",
-    description="Forensic analysis tools from SANS SIFT Workstation (read-only)",
+    instructions="Forensic analysis tools from SANS SIFT Workstation (read-only)",
 )
 
 
