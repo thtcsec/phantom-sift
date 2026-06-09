@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cloudflare Workers
+remote-mcp/node_modules/
+remote-mcp/.wrangler/
+remote-mcp/dist/
+
+# Evidence data (never commit)
+evidence/
+case-data/
+*.dd
+*.raw
+*.E01
+*.vmem
+*.dmp
+
+# Logs (structured logs committed selectively)
+logs/*.jsonl
+!logs/.gitkeep
+
+# Model artifacts
+models/
+*.pkl
+*.joblib

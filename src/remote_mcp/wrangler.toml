@@ -1,0 +1,11 @@
+# Cloudflare Workers configuration for Phantom SIFT Remote MCP Server
+name = "phantom-sift-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets (set via `wrangler secret put`)
+# VIRUSTOTAL_API_KEY
+# ABUSEIPDB_API_KEY
